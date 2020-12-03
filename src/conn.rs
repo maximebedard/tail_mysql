@@ -15,44 +15,28 @@ use super::protocol::{
 use super::value::Value;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConnectError {
-  #[error("Unable to resolve address due to IO error")]
+pub enum DriverError {
+  #[error("Failed due to IO error")]
   Io(#[from] io::Error),
   #[error("Unable to resolve address, host `{0}` is unreachable")]
   UnreachableHost(String),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum HandshakeError {
-  #[error("Unable to complete handshake due to codec error")]
-  Codec(#[from] CodecError),
-
-  #[error("io err")]
-  Io(#[from] io::Error),
-
-  #[error("ZZZZ")]
-  ServerError(#[from] ServerError2),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CodecError {
-  #[error("unexpected packet")]
+  #[error("Unexpected packet")]
   UnexpectedPacket,
-  #[error("io err")]
-  Io(#[from] io::Error),
-  #[error("woeiruwer")]
+  #[error("Connection was reseted by MYSQL")]
   ConnectionResetByPeer,
-  #[error("WERWER")]
+  #[error("Packets sequence_id are out of sync with MYSQL")]
   PacketOutOfSync,
-  #[error("!@#!@#")]
+  #[error("Connection was closed by the client")]
   ConnectionClosed,
-  #[error("WERWERzz")]
-  ServerError(#[from] ServerError2),
+  #[error("Failed due to server error")]
+  UpstreamError(#[from] UpstreamError),
 }
 
+type DriverResult<T> = Result<T, DriverError>;
+
 #[derive(Debug, thiserror::Error)]
-pub enum ServerError2 {
-  #[error("WEWW")]
+pub enum UpstreamError {
+  #[error("todo")]
   Something,
 }
 
@@ -63,6 +47,7 @@ pub struct ConnectionOptions {
   user: Option<String>,
   password: Option<String>,
   db_name: Option<String>,
+  hostname: Option<String>,
 }
 
 impl ConnectionOptions {
@@ -107,6 +92,7 @@ impl Default for ConnectionOptions {
       user: Some("root".into()),
       password: None,
       db_name: None,
+      hostname: None,
     }
   }
 }
@@ -125,12 +111,14 @@ impl From<Url> for ConnectionOptions {
     let user = Some(url.username().to_string());
     let password = url.password().map(Into::into);
     let db_name = None;
+    let hostname = None;
     Self {
       host,
       port,
       user,
       password,
       db_name,
+      hostname,
     }
   }
 }
@@ -161,7 +149,7 @@ pub struct Connection {
 }
 
 impl Connection {
-  pub async fn connect(opts: impl Into<ConnectionOptions>) -> Result<Self, ConnectError> {
+  pub async fn connect(opts: impl Into<ConnectionOptions>) -> DriverResult<Self> {
     let opts = opts.into();
     let port = opts.port;
     let addr = match opts.host {
@@ -169,7 +157,7 @@ impl Connection {
         let mut hosts = lookup_host(format!("{}:{}", domain, port)).await?;
         hosts
           .next()
-          .ok_or(ConnectError::UnreachableHost(domain.clone()))
+          .ok_or(DriverError::UnreachableHost(domain.clone()))
       }
       Some(Host::V4(ipv4)) => Ok(SocketAddrV4::new(ipv4, port).into()),
       Some(Host::V6(ipv6)) => Ok(SocketAddrV6::new(ipv6, port, 0, 0).into()),
@@ -202,7 +190,7 @@ impl Connection {
     Ok(connection)
   }
 
-  pub async fn handshake(&mut self) -> Result<(), HandshakeError> {
+  pub async fn handshake(&mut self) -> DriverResult<()> {
     // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html
     let packet = self.read_payload().await?;
 
@@ -212,11 +200,11 @@ impl Connection {
     }
   }
 
-  fn handle_server_error(&mut self, err: ServerError) -> ServerError2 {
+  fn handle_server_error(&mut self, err: ServerError) -> UpstreamError {
     panic!("err = {:?}", err);
   }
 
-  async fn handle_handshake(&mut self, p: Handshake) -> Result<(), HandshakeError> {
+  async fn handle_handshake(&mut self, p: Handshake) -> DriverResult<()> {
     if p.protocol_version() != 10u8 {
       panic!("not supported")
     }
@@ -232,17 +220,7 @@ impl Connection {
     self.capabilities = p.capabilities() & default_capabilities(&self.opts);
     self.status_flags = p.status_flags();
     self.character_set = p.character_set();
-
-    // TODO: update connection state.
-    // self.capabilities = p.capabilities() & self.opts.default_capabilities();
-    // fn handle_handshake(&mut self, hp: &HandshakePacket<'_>) {
-    //     self.capability_flags = hp.capabilities() & self.get_client_flags();
-    //     self.status_flags = hp.status_flags();
-    //     self.connection_id = hp.connection_id();
-    //     self.character_set = hp.default_collation();
-    //     self.server_version = hp.server_version_parsed();
-    //     self.mariadb_server_version = hp.maria_db_server_version_parsed();
-    // }
+    // potentially keep the server version too?
 
     if self.opts.ssl_enabled() {
       // TODO: ssl
@@ -265,7 +243,7 @@ impl Connection {
     Ok(())
   }
 
-  pub async fn query(&mut self, query: impl AsRef<str>) -> Result<QueryResults, CodecError> {
+  pub async fn query(&mut self, query: impl AsRef<str>) -> DriverResult<QueryResults> {
     // TODO: Vec<T> could potentially be a stream if we want to support multi result sets...
     self
       .write_command(Command::COM_QUERY, query.as_ref().as_bytes())
@@ -273,16 +251,16 @@ impl Connection {
     self.read_results().await
   }
 
-  pub async fn first(&mut self, query: impl AsRef<str>) -> Result<Option<()>, CodecError> {
+  pub async fn first(&mut self, query: impl AsRef<str>) -> DriverResult<Option<()>> {
     self.query(query).await.map(|r| r.first())
   }
 
-  pub async fn ping(&mut self) -> Result<(), CodecError> {
+  pub async fn ping(&mut self) -> DriverResult<()> {
     self.write_command(Command::COM_PING, &[]).await?;
     self.read_ok().await
   }
 
-  async fn write_command(&mut self, cmd: Command, payload: &[u8]) -> Result<(), CodecError> {
+  async fn write_command(&mut self, cmd: Command, payload: &[u8]) -> DriverResult<()> {
     self.sequence_id = 0;
     self.last_command_id = cmd as u8;
 
@@ -293,7 +271,7 @@ impl Connection {
     self.write_payload(&b[..]).await
   }
 
-  async fn write_payload(&mut self, payload: &[u8]) -> Result<(), CodecError> {
+  async fn write_payload(&mut self, payload: &[u8]) -> DriverResult<()> {
     for chunk in payload.chunks(MAX_PAYLOAD_LEN) {
       let mut b = BytesMut::with_capacity(4 + chunk.len());
       b.put_uint_le(chunk.len() as u64, 3);
@@ -309,7 +287,7 @@ impl Connection {
     Ok(())
   }
 
-  async fn read_ok(&mut self) -> Result<(), CodecError> {
+  async fn read_ok(&mut self) -> DriverResult<()> {
     let payload = self.read_payload().await?;
     let ok = payload.as_server_ok(self.capabilities)?;
 
@@ -317,7 +295,7 @@ impl Connection {
     Ok(())
   }
 
-  async fn read_results(&mut self) -> Result<QueryResults, CodecError> {
+  async fn read_results(&mut self) -> DriverResult<QueryResults> {
     let payload = self.read_payload().await?;
     let query_response = payload.as_query_response(self.capabilities)?;
 
@@ -340,10 +318,7 @@ impl Connection {
     }
   }
 
-  async fn read_columns(
-    &mut self,
-    column_count: usize,
-  ) -> Result<Vec<ColumnDefinition>, CodecError> {
+  async fn read_columns(&mut self, column_count: usize) -> DriverResult<Vec<ColumnDefinition>> {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::Resultset
     let mut columns = Vec::with_capacity(column_count);
     for i in 0..column_count {
@@ -362,7 +337,7 @@ impl Connection {
     Ok(columns)
   }
 
-  async fn read_rows(&mut self, columns: &Vec<ColumnDefinition>) -> Result<Vec<Row>, CodecError> {
+  async fn read_rows(&mut self, columns: &Vec<ColumnDefinition>) -> DriverResult<Vec<Row>> {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::ResultsetRow
     let mut rows = Vec::new();
     loop {
@@ -382,11 +357,7 @@ impl Connection {
     Ok(rows)
   }
 
-  async fn authenticate(
-    &mut self,
-    auth_plugin_name: &str,
-    nonce: &[u8],
-  ) -> Result<(), HandshakeError> {
+  async fn authenticate(&mut self, auth_plugin_name: &str, nonce: &[u8]) -> DriverResult<()> {
     let payload = self.read_payload().await?;
     let auth_response = payload.as_auth_response(self.capabilities)?;
 
@@ -416,7 +387,7 @@ impl Connection {
     self.warnings = ok.warnings().unwrap_or(0);
   }
 
-  async fn read_payload(&mut self) -> Result<Payload, CodecError> {
+  async fn read_payload(&mut self) -> DriverResult<Payload> {
     let packet = self.read_packet().await?;
     self.check_sequence_id(packet.sequence_id())?;
     let payload = packet.as_payload();
@@ -424,9 +395,9 @@ impl Connection {
     Ok(payload)
   }
 
-  pub fn check_sequence_id(&mut self, sequence_id: u8) -> Result<(), CodecError> {
+  pub fn check_sequence_id(&mut self, sequence_id: u8) -> DriverResult<()> {
     if self.sequence_id != sequence_id {
-      return Err(CodecError::PacketOutOfSync);
+      return Err(DriverError::PacketOutOfSync);
     }
 
     self.sequence_id = self.sequence_id.wrapping_add(1);
@@ -437,7 +408,7 @@ impl Connection {
     &mut self,
     auth_plugin_name: &str,
     scrambled_data: Option<Vec<u8>>,
-  ) -> Result<(), CodecError> {
+  ) -> DriverResult<()> {
     let auth_plugin_name = auth_plugin_name.as_bytes();
     let auth_plugin_len = auth_plugin_name.len();
     let user = self.opts.user().map(str::as_bytes);
@@ -483,7 +454,7 @@ impl Connection {
   }
 
   // TODO: move this out of here...
-  async fn read_packet(&mut self) -> Result<Packet, CodecError> {
+  async fn read_packet(&mut self) -> DriverResult<Packet> {
     loop {
       let mut buf = Cursor::new(&self.buffer[..]);
 
@@ -501,15 +472,101 @@ impl Connection {
       // On success, the number of bytes is returned. `0` indicates "end of stream".
       if self.stream.read_buf(&mut self.buffer).await? == 0 {
         if self.buffer.is_empty() {
-          return Err(CodecError::ConnectionClosed);
+          return Err(DriverError::ConnectionClosed);
         } else {
-          return Err(CodecError::ConnectionResetByPeer);
+          return Err(DriverError::ConnectionResetByPeer);
         }
       }
     }
   }
 
-  pub async fn into_binlog_stream(mut self) -> Result<BinlogStream, CodecError> {
+  async fn get_system_variable(&mut self, var: impl AsRef<str>) -> DriverResult<Option<()>> {
+    self.first(format!("SELECT @@{}", var.as_ref())).await
+  }
+
+  pub async fn binlog_stream(&mut self) -> DriverResult<BinlogStream> {
+    let r = self.first("SHOW MASTER STATUS").await?;
+    let file = "toto";
+    let position = 0;
+
+    self.resume_binlog_stream(file, position).await
+  }
+
+  pub async fn resume_binlog_stream(
+    &mut self,
+    file: impl AsRef<str>,
+    position: usize,
+  ) -> DriverResult<BinlogStream> {
+    self.ensure_checksum_is_disabled().await?;
+    self.register_as_replica().await?;
+    self.dump_binlog(file, position).await?;
+    todo!()
+  }
+
+  async fn ensure_checksum_is_disabled(&mut self) -> DriverResult<()> {
+    //       let checksum = self.get_system_var("binlog_checksum")
+    //           .map(from_value::<String>)
+    //           .unwrap_or("NONE".to_owned());
+
+    //       match checksum.as_ref() {
+    //           "NONE" => Ok(()),
+    //           "CRC32" => {
+    //               self.query("SET @master_binlog_checksum='NONE'")?;
+    //               Ok(())
+    //           }
+    //           _ => Err(DriverError(UnexpectedPacket)),
+    //       }
+    todo!()
+  }
+
+  async fn register_as_replica(&mut self) -> DriverResult<()> {
+    //       match hostname::get_hostname() {
+    //           Some(local_hostname) => {
+    //               let user = self.opts.get_user().unwrap();
+    //               let password = self.opts.get_pass().unwrap_or_default();
+    //               let server_id = self.opts.get_server_id();
+    //               let mut buf = vec![0; 4+1+4+1+local_hostname.len()+1+user.len()+1+password.len()+2+4+4];
+
+    //               {
+    //                   let mut writer = &mut buf[..];
+    //                   writer.write_u32::<LE>(server_id)?;
+    //                   writer.write_u8(local_hostname.len() as u8)?;
+    //                   writer.write_all(local_hostname.as_bytes())?;
+    //                   writer.write_u8(user.len() as u8)?;
+    //                   writer.write_all(user.as_bytes())?;
+    //                   writer.write_u8(password.len() as u8)?;
+    //                   writer.write_all(password.as_bytes())?;
+    //                   writer.write_u16::<LE>(self.opts.get_tcp_port())?;
+    //                   writer.write_u32::<LE>(0u32)?;
+    //                   writer.write_u32::<LE>(0u32)?;
+    //               }
+
+    //               self.write_command_data(Command::COM_REGISTER_SLAVE, &buf)?;
+    //               self.handle_result_set()
+    //           }
+    //           None => Err(DriverError(UnexpectedPacket)),
+    //       }
+    todo!()
+  }
+
+  async fn dump_binlog(&mut self, file: impl AsRef<str>, position: usize) -> DriverResult<()> {
+    //       let server_id = self.opts.get_server_id();
+    //       let mut buf = vec![0; 4 + 4 + 2 + 4 + file_name.len() + 1];
+
+    //       {
+    //           let mut writer = &mut buf[..];
+    //           writer.write_u32::<LE>(position)?;
+    //           writer.write_u16::<LE>(0u16)?;
+    //           writer.write_u32::<LE>(server_id)?;
+    //           writer.write_all(file_name.as_bytes())?;
+    //       }
+
+    //       self.write_command_data(Command::COM_BINLOG_DUMP, &buf)?;
+    //       self.handle_result_set()
+    todo!()
+  }
+
+  pub async fn into_binlog_stream(mut self) -> DriverResult<BinlogStream> {
     let r = self.first("show master status").await?;
     Ok(BinlogStream)
   }
@@ -529,66 +586,6 @@ impl Connection {
   //       self._write_binlog_dump_command(file_name, position)?;
 
   //       Ok(Box::new(move || { self.read_packet() }))
-  //   }
-
-  //   fn _disable_checksum(&mut self) -> MyResult<()> {
-  //       let checksum = self.get_system_var("binlog_checksum")
-  //           .map(from_value::<String>)
-  //           .unwrap_or("NONE".to_owned());
-
-  //       match checksum.as_ref() {
-  //           "NONE" => Ok(()),
-  //           "CRC32" => {
-  //               self.query("SET @master_binlog_checksum='NONE'")?;
-  //               Ok(())
-  //           }
-  //           _ => Err(DriverError(UnexpectedPacket)),
-  //       }
-  //   }
-
-  //   fn _write_register_slave_command(&mut self) -> MyResult<Vec<Column>> {
-  //       match hostname::get_hostname() {
-  //           Some(local_hostname) => {
-  //               let user = self.opts.get_user().unwrap();
-  //               let password = self.opts.get_pass().unwrap_or_default();
-  //               let server_id = self.opts.get_server_id();
-  //               let mut buf = vec![0; 4+1+4+1+local_hostname.len()+1+user.len()+1+password.len()+2+4+4];
-
-  //               {
-  //                   let mut writer = &mut buf[..];
-  //                   writer.write_u32::<LE>(server_id)?;
-  //                   writer.write_u8(local_hostname.len() as u8)?;
-  //                   writer.write_all(local_hostname.as_bytes())?;
-  //                   writer.write_u8(user.len() as u8)?;
-  //                   writer.write_all(user.as_bytes())?;
-  //                   writer.write_u8(password.len() as u8)?;
-  //                   writer.write_all(password.as_bytes())?;
-  //                   writer.write_u16::<LE>(self.opts.get_tcp_port())?;
-  //                   writer.write_u32::<LE>(0u32)?;
-  //                   writer.write_u32::<LE>(0u32)?;
-  //               }
-
-  //               self.write_command_data(Command::COM_REGISTER_SLAVE, &buf)?;
-  //               self.handle_result_set()
-  //           }
-  //           None => Err(DriverError(UnexpectedPacket)),
-  //       }
-  //   }
-
-  //   fn _write_binlog_dump_command(&mut self, file_name: String, position: u32) -> MyResult<Vec<Column>> {
-  //       let server_id = self.opts.get_server_id();
-  //       let mut buf = vec![0; 4 + 4 + 2 + 4 + file_name.len() + 1];
-
-  //       {
-  //           let mut writer = &mut buf[..];
-  //           writer.write_u32::<LE>(position)?;
-  //           writer.write_u16::<LE>(0u16)?;
-  //           writer.write_u32::<LE>(server_id)?;
-  //           writer.write_all(file_name.as_bytes())?;
-  //       }
-
-  //       self.write_command_data(Command::COM_BINLOG_DUMP, &buf)?;
-  //       self.handle_result_set()
   //   }
 }
 
