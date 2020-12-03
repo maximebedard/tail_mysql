@@ -10,7 +10,7 @@ Wanted to get a bit more familiar with tokio, and decoding things are fun. And i
 
 - [x] Simple text queries
 - [x] MYSQL >= 5.7.5
-- [-] Binlog streaming (in progress)
+- [ ] Binlog streaming (in progress)
 - [ ] Map/reduce
 - [ ] Custom sinks
 - [ ] SSL
