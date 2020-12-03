@@ -1,0 +1,16 @@
+[package]
+name = "tail_mysql"
+version = "0.1.0"
+authors = ["Maxime Bedard <maxime.bedard@shopify.com>"]
+edition = "2018"
+
+[dependencies]
+url = "2.2"
+clap = "2.33"
+bytes = "0.5"
+futures = { version = "0.3" }
+tokio = { version = "0.2", features = ["full"] }
+thiserror = "1.0"
+bitflags = "1.2"
+sha1 = "0.6"
+sha2 = "0.9"
