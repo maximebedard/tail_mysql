@@ -7,10 +7,10 @@ use tokio::net::{lookup_host, TcpStream};
 use url::{Host as UrlHost, Url};
 
 use super::protocol::{
-  AuthResponse, CapabilityFlags, CharacterSet, ColumnDefinition, ColumnDefinitionResponse, Command,
-  Handshake, HandshakeResponse, Packet, Payload, QueryResponse, Row, RowResponse, ServerError,
-  ServerOk, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME, MAX_PAYLOAD_LEN,
-  MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
+  AuthResponse, BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnDefinition,
+  ColumnDefinitionResponse, Command, Handshake, HandshakeResponse, Packet, Payload, QueryResponse,
+  Row, RowResponse, ServerError, ServerOk, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME,
+  MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
 use super::value::Value;
 
@@ -48,6 +48,7 @@ pub struct ConnectionOptions {
   password: Option<String>,
   db_name: Option<String>,
   hostname: Option<String>,
+  server_id: Option<u32>,
 }
 
 impl ConnectionOptions {
@@ -73,9 +74,7 @@ impl ConnectionOptions {
   fn pid(&self) -> usize {
     todo!()
   }
-  fn hostname(&self) -> &str {
-    todo!()
-  }
+
   fn compression_enabled(&self) -> bool {
     false
   }
@@ -93,6 +92,7 @@ impl Default for ConnectionOptions {
       password: None,
       db_name: None,
       hostname: None,
+      server_id: None,
     }
   }
 }
@@ -112,6 +112,7 @@ impl From<Url> for ConnectionOptions {
     let password = url.password().map(Into::into);
     let db_name = None;
     let hostname = None;
+    let server_id = None;
     Self {
       host,
       port,
@@ -119,6 +120,7 @@ impl From<Url> for ConnectionOptions {
       password,
       db_name,
       hostname,
+      server_id,
     }
   }
 }
@@ -130,6 +132,53 @@ impl From<UrlHost<&str>> for Host {
       UrlHost::Ipv4(ipv4) => Host::V4(ipv4),
       UrlHost::Ipv6(ipv6) => Host::V6(ipv6),
     }
+  }
+}
+
+pub struct ReplicationOptions {
+  hostname: Option<String>,
+  user: Option<String>,
+  password: Option<String>,
+  server_id: u32,
+  port: u16,
+}
+
+impl Default for ReplicationOptions {
+  fn default() -> Self {
+    let hostname = None;
+    let user = None;
+    let password = None;
+    let server_id = 1;
+    let port = 3306;
+    Self {
+      hostname,
+      user,
+      password,
+      server_id,
+      port,
+    }
+  }
+}
+
+impl ReplicationOptions {
+  pub fn server_id(&self) -> u32 {
+    self.server_id
+  }
+
+  pub fn port(&self) -> u16 {
+    self.port
+  }
+
+  pub fn hostname(&self) -> Option<&str> {
+    self.hostname.as_ref().map(String::as_str)
+  }
+
+  pub fn password(&self) -> Option<&str> {
+    self.password.as_ref().map(String::as_str)
+  }
+
+  pub fn user(&self) -> Option<&str> {
+    self.user.as_ref().map(String::as_str)
   }
 }
 
@@ -484,22 +533,32 @@ impl Connection {
     self.first(format!("SELECT @@{}", var.as_ref())).await
   }
 
-  pub async fn binlog_stream(&mut self) -> DriverResult<BinlogStream> {
+  pub async fn binlog_stream(
+    &mut self,
+    replication_opts: impl Into<ReplicationOptions>,
+  ) -> DriverResult<BinlogStream> {
     let r = self.first("SHOW MASTER STATUS").await?;
     let file = "toto";
     let position = 0;
 
-    self.resume_binlog_stream(file, position).await
+    self
+      .resume_binlog_stream(replication_opts, file, position)
+      .await
   }
 
   pub async fn resume_binlog_stream(
     &mut self,
+    replication_opts: impl Into<ReplicationOptions>,
     file: impl AsRef<str>,
-    position: usize,
+    position: u32,
   ) -> DriverResult<BinlogStream> {
+    let replication_opts = replication_opts.into();
+    let server_id = replication_opts.server_id();
+
     self.ensure_checksum_is_disabled().await?;
-    self.register_as_replica().await?;
-    self.dump_binlog(file, position).await?;
+    self.register_as_replica(&replication_opts).await?;
+    self.dump_binlog(server_id, file, position).await?;
+
     todo!()
   }
 
@@ -519,56 +578,58 @@ impl Connection {
     todo!()
   }
 
-  async fn register_as_replica(&mut self) -> DriverResult<()> {
-    //       match hostname::get_hostname() {
-    //           Some(local_hostname) => {
-    //               let user = self.opts.get_user().unwrap();
-    //               let password = self.opts.get_pass().unwrap_or_default();
-    //               let server_id = self.opts.get_server_id();
-    //               let mut buf = vec![0; 4+1+4+1+local_hostname.len()+1+user.len()+1+password.len()+2+4+4];
+  async fn register_as_replica(
+    &mut self,
+    replication_opts: &ReplicationOptions,
+  ) -> DriverResult<()> {
+    let hostname = replication_opts.hostname().unwrap_or("").as_bytes();
+    let user = replication_opts.user().unwrap_or("").as_bytes();
+    let password = replication_opts.password().unwrap_or("").as_bytes();
+    let server_id = replication_opts.server_id();
+    let port = replication_opts.port();
 
-    //               {
-    //                   let mut writer = &mut buf[..];
-    //                   writer.write_u32::<LE>(server_id)?;
-    //                   writer.write_u8(local_hostname.len() as u8)?;
-    //                   writer.write_all(local_hostname.as_bytes())?;
-    //                   writer.write_u8(user.len() as u8)?;
-    //                   writer.write_all(user.as_bytes())?;
-    //                   writer.write_u8(password.len() as u8)?;
-    //                   writer.write_all(password.as_bytes())?;
-    //                   writer.write_u16::<LE>(self.opts.get_tcp_port())?;
-    //                   writer.write_u32::<LE>(0u32)?;
-    //                   writer.write_u32::<LE>(0u32)?;
-    //               }
+    let payload_len = 4 + 1 + hostname.len() + 1 + user.len() + 1 + password.len() + 2 + 4 + 4;
 
-    //               self.write_command_data(Command::COM_REGISTER_SLAVE, &buf)?;
-    //               self.handle_result_set()
-    //           }
-    //           None => Err(DriverError(UnexpectedPacket)),
-    //       }
+    let mut b = BytesMut::with_capacity(payload_len);
+
+    b.put_u32_le(server_id);
+    b.put_u8(hostname.len() as u8);
+    b.put(hostname);
+    b.put_u8(user.len() as u8);
+    b.put(user);
+    b.put_u8(password.len() as u8);
+    b.put(password);
+    b.put_u16_le(port);
+    b.put_u32(0); // replication_rank ignored.
+    b.put_u32(0); // master id is usually 0.
+
+    self
+      .write_command(Command::COM_REGISTER_SLAVE, &b[..])
+      .await?;
+    // TODO handle response
     todo!()
   }
 
-  async fn dump_binlog(&mut self, file: impl AsRef<str>, position: usize) -> DriverResult<()> {
-    //       let server_id = self.opts.get_server_id();
-    //       let mut buf = vec![0; 4 + 4 + 2 + 4 + file_name.len() + 1];
+  async fn dump_binlog(
+    &mut self,
+    server_id: u32,
+    file: impl AsRef<str>,
+    position: u32,
+  ) -> DriverResult<()> {
+    let file = file.as_ref().as_bytes();
+    let file_len = file.len();
 
-    //       {
-    //           let mut writer = &mut buf[..];
-    //           writer.write_u32::<LE>(position)?;
-    //           writer.write_u16::<LE>(0u16)?;
-    //           writer.write_u32::<LE>(server_id)?;
-    //           writer.write_all(file_name.as_bytes())?;
-    //       }
+    let payload_len = 4 + 2 + 4 + file_len + 1;
 
-    //       self.write_command_data(Command::COM_BINLOG_DUMP, &buf)?;
-    //       self.handle_result_set()
+    let mut b = BytesMut::with_capacity(payload_len);
+    b.put_u32_le(position);
+    b.put_u16_le(BinlogDumpFlags::empty().bits());
+    b.put_u32_le(server_id);
+    b.put(file);
+
+    self.write_command(Command::COM_BINLOG_DUMP, &b[..]).await?;
+    // TODO handle response
     todo!()
-  }
-
-  pub async fn into_binlog_stream(mut self) -> DriverResult<BinlogStream> {
-    let r = self.first("show master status").await?;
-    Ok(BinlogStream)
   }
 
   // pub fn binlog_reader(mut self) -> MyResult<Box<(FnMut() -> MyResult<Vec<u8>>)>> {

@@ -30,6 +30,12 @@ bitflags! {
   }
 }
 
+bitflags! {
+  pub struct BinlogDumpFlags: u16 {
+    const NON_BLOCK = 0x0001;
+  }
+}
+
 // https://dev.mysql.com/doc/internals/en/capability-flags.html#flag-CLIENT_PROTOCOL_41
 bitflags! {
     pub struct CapabilityFlags: u32 {
