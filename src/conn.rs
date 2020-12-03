@@ -2,6 +2,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::io;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{lookup_host, TcpStream};
 use url::{Host as UrlHost, Url};
@@ -198,6 +199,7 @@ pub struct Connection {
 }
 
 impl Connection {
+  /// Establish a connection to MYSQL.
   pub async fn connect(opts: impl Into<ConnectionOptions>) -> DriverResult<Self> {
     let opts = opts.into();
     let port = opts.port;
@@ -292,6 +294,7 @@ impl Connection {
     Ok(())
   }
 
+  /// Send a text query to MYSQL and returns a result set.
   pub async fn query(&mut self, query: impl AsRef<str>) -> DriverResult<QueryResults> {
     // TODO: Vec<T> could potentially be a stream if we want to support multi result sets...
     self
@@ -300,8 +303,9 @@ impl Connection {
     self.read_results().await
   }
 
-  pub async fn first(&mut self, query: impl AsRef<str>) -> DriverResult<Option<()>> {
-    self.query(query).await.map(|r| r.first())
+  /// Send a text query to MYSQL and yield only the first result.
+  pub async fn pop(&mut self, query: impl AsRef<str>) -> DriverResult<Option<QueryResult>> {
+    self.query(query).await.map(QueryResults::pop)
   }
 
   pub async fn ping(&mut self) -> DriverResult<()> {
@@ -360,7 +364,10 @@ impl Connection {
       QueryResponse::ResultSet(column_count) => {
         let columns = self.read_columns(column_count as usize).await?;
         let rows = self.read_rows(&columns).await?;
-        let query_results = QueryResults { columns, rows };
+        let query_results = QueryResults {
+          columns: Arc::new(columns),
+          rows,
+        };
         Ok(query_results)
       }
       QueryResponse::LocalInfile(p) => todo!("not supported"),
@@ -444,7 +451,7 @@ impl Connection {
     Ok(payload)
   }
 
-  pub fn check_sequence_id(&mut self, sequence_id: u8) -> DriverResult<()> {
+  fn check_sequence_id(&mut self, sequence_id: u8) -> DriverResult<()> {
     if self.sequence_id != sequence_id {
       return Err(DriverError::PacketOutOfSync);
     }
@@ -529,15 +536,19 @@ impl Connection {
     }
   }
 
-  async fn get_system_variable(&mut self, var: impl AsRef<str>) -> DriverResult<Option<()>> {
-    self.first(format!("SELECT @@{}", var.as_ref())).await
+  async fn get_system_variable(
+    &mut self,
+    var: impl AsRef<str>,
+  ) -> DriverResult<Option<QueryResult>> {
+    self.pop(format!("SELECT @@{}", var.as_ref())).await
   }
 
+  /// Returns a stream that yields binlog events.
   pub async fn binlog_stream(
     &mut self,
     replication_opts: impl Into<ReplicationOptions>,
   ) -> DriverResult<BinlogStream> {
-    let r = self.first("SHOW MASTER STATUS").await?;
+    let r = self.pop("SHOW MASTER STATUS").await?;
     let file = "toto";
     let position = 0;
 
@@ -546,6 +557,7 @@ impl Connection {
       .await
   }
 
+  /// Returns a stream that yields binlog events, starting from a given position and binlog file.
   pub async fn resume_binlog_stream(
     &mut self,
     replication_opts: impl Into<ReplicationOptions>,
@@ -699,21 +711,46 @@ pub fn scramble_password(
 
 pub struct BinlogStream;
 
+/// Owned results for 0..N rows.
 pub struct QueryResults {
-  columns: Vec<ColumnDefinition>,
+  columns: Arc<Vec<ColumnDefinition>>,
   rows: Vec<Row>,
 }
 
 impl QueryResults {
-  pub fn first(&self) -> Option<()> {
-    None
+  /// Consumes self and return only the first result.
+  pub fn pop(mut self) -> Option<QueryResult> {
+    self.rows.pop().map(|row| QueryResult {
+      columns: self.columns.clone(),
+      row,
+    })
+  }
+
+  /// Returns a reference to the first result.
+  pub fn first(&self) -> Option<QueryResultRef<'_>> {
+    self.rows.first().map(|row| QueryResultRef {
+      columns: self.columns.clone(),
+      row,
+    })
   }
 }
 
 impl Default for QueryResults {
   fn default() -> Self {
-    let columns = Vec::new();
+    let columns = Arc::new(Vec::new());
     let rows = Vec::new();
     Self { columns, rows }
   }
+}
+
+/// Owned result for a single row.
+pub struct QueryResult {
+  columns: Arc<Vec<ColumnDefinition>>,
+  row: Row,
+}
+
+/// Reference to a single row.
+pub struct QueryResultRef<'a> {
+  columns: Arc<Vec<ColumnDefinition>>,
+  row: &'a Row,
 }
