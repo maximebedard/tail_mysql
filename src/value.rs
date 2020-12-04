@@ -1,5 +1,5 @@
 use super::buf_ext::BufExt;
-use super::protocol::{ColumnDefinition, ColumnFlags, ColumnType};
+use super::protocol::{Column, ColumnFlags, ColumnType};
 use bytes::{Buf, Bytes};
 use std::io;
 
@@ -30,14 +30,14 @@ pub enum Value {
 }
 
 impl Value {
-  pub fn parse2(mut buffer: impl Buf, cd: &ColumnDefinition) -> io::Result<Self> {
+  pub fn parse2(mut buffer: impl Buf, column: &Column) -> io::Result<Self> {
     // TODO: this can most likely be much better....
     if buffer.bytes()[0] == 0xFB {
       Ok(Value::Null)
     } else {
       let bytes = buffer.get_lenc_bytes();
-      let unsigned = cd.flags().contains(ColumnFlags::UNSIGNED);
-      Self::parse(bytes, cd.column_type(), unsigned)
+      let unsigned = column.flags().contains(ColumnFlags::UNSIGNED);
+      Self::parse(bytes, column.column_type(), unsigned)
     }
   }
 

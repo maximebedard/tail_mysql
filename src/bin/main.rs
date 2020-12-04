@@ -1,6 +1,7 @@
 use futures::future::FutureExt;
+use futures::stream::StreamExt;
 use futures::select;
-use tail_mysql::conn::Connection;
+use tail_mysql::conn::{Connection, ReplicationOptions};
 use tokio::sync::oneshot::{self, Receiver as OneshotReceiver};
 use url::Url;
 
@@ -59,4 +60,12 @@ async fn streamer(mysql_url: Url, _gracefully_close: OneshotReceiver<()>) {
 
   println!("sending version query");
   let _results = conn.query("SELECT VERSION();").await.unwrap();
+
+  let stream = conn.binlog_stream(ReplicationOptions::default()).await.unwrap();
+
+  futures::pin_mut!(stream);
+
+  while let Some(evt) = stream.next().await {
+    println!("{:?}", evt);
+  }
 }

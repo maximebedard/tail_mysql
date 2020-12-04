@@ -698,7 +698,7 @@ impl Payload {
         capabilities,
       )?)),
       _ => Ok(ColumnDefinitionResponse::ColumnDefinition(
-        ColumnDefinition::parse(self.0)?,
+        Column::parse(self.0)?,
       )),
     }
   }
@@ -706,7 +706,7 @@ impl Payload {
   pub fn as_row_response(
     self,
     capabilities: CapabilityFlags,
-    columns: &Vec<ColumnDefinition>,
+    columns: &Vec<Column>,
   ) -> io::Result<RowResponse> {
     match self.0[0] {
       // TODO: I think i would have to check for lenght here according to https://dev.mysql.com/doc/internals/en/packet-EOF_Packet.html.
@@ -759,11 +759,11 @@ pub enum QueryResponse {
 
 pub enum ColumnDefinitionResponse {
   Success(ServerOk),
-  ColumnDefinition(ColumnDefinition),
+  ColumnDefinition(Column),
 }
 
 #[derive(Debug)]
-pub struct ColumnDefinition {
+pub struct Column {
   catalog: String,
   schema: String,
   table: String,
@@ -776,7 +776,7 @@ pub struct ColumnDefinition {
   decimals: u8,
 }
 
-impl ColumnDefinition {
+impl Column {
   fn parse(buffer: impl Into<Bytes>) -> io::Result<Self> {
     let mut b = buffer.into();
     let catalog = b.get_lenc_string();

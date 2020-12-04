@@ -6,9 +6,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{lookup_host, TcpStream};
 use url::{Host as UrlHost, Url};
+use futures::stream::{self, Stream};
 
 use super::protocol::{
-  AuthResponse, BinlogDumpFlags, CapabilityFlags, CharacterSet, ColumnDefinition,
+  AuthResponse, BinlogDumpFlags, CapabilityFlags, CharacterSet, Column,
   ColumnDefinitionResponse, Command, Handshake, HandshakeResponse, Packet, Payload, QueryResponse,
   Row, RowResponse, ServerError, ServerOk, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME,
   MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
@@ -374,7 +375,7 @@ impl Connection {
     }
   }
 
-  async fn read_columns(&mut self, column_count: usize) -> DriverResult<Vec<ColumnDefinition>> {
+  async fn read_columns(&mut self, column_count: usize) -> DriverResult<Vec<Column>> {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::Resultset
     let mut columns = Vec::with_capacity(column_count);
     for i in 0..column_count {
@@ -393,7 +394,7 @@ impl Connection {
     Ok(columns)
   }
 
-  async fn read_rows(&mut self, columns: &Vec<ColumnDefinition>) -> DriverResult<Vec<Row>> {
+  async fn read_rows(&mut self, columns: &Vec<Column>) -> DriverResult<Vec<Row>> {
     // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-ProtocolText::ResultsetRow
     let mut rows = Vec::new();
     loop {
@@ -543,27 +544,28 @@ impl Connection {
     self.pop(format!("SELECT @@{}", var.as_ref())).await
   }
 
-  /// Returns a stream that yields binlog events.
-  pub async fn binlog_stream(
-    &mut self,
+  /// Returns a stream that yields binlog events, starting from the very beginning of the current log.
+  pub async fn binlog_stream<'a>(
+    &'a mut self,
     replication_opts: impl Into<ReplicationOptions>,
-  ) -> DriverResult<BinlogStream> {
+  ) -> DriverResult<impl Stream<Item = BinlogEvent> + 'a> {
     let r = self.pop("SHOW MASTER STATUS").await?;
     let file = "toto";
     let position = 0;
+    let opts = replication_opts.into();
 
     self
-      .resume_binlog_stream(replication_opts, file, position)
+      .resume_binlog_stream(opts, file, position)
       .await
   }
 
   /// Returns a stream that yields binlog events, starting from a given position and binlog file.
-  pub async fn resume_binlog_stream(
-    &mut self,
+  pub async fn resume_binlog_stream<'a>(
+    &'a mut self,
     replication_opts: impl Into<ReplicationOptions>,
     file: impl AsRef<str>,
     position: u32,
-  ) -> DriverResult<BinlogStream> {
+  ) -> DriverResult<impl Stream<Item = BinlogEvent> + 'a> {
     let replication_opts = replication_opts.into();
     let server_id = replication_opts.server_id();
 
@@ -571,10 +573,22 @@ impl Connection {
     self.register_as_replica(&replication_opts).await?;
     self.dump_binlog(server_id, file, position).await?;
 
-    todo!()
+    let stream = futures::stream::unfold(self, |this| async move {
+      this.read_packet().await.unwrap();
+      // TODO: parse this into proper binlog events...
+      None
+    });
+
+    Ok(stream)
   }
 
   async fn ensure_checksum_is_disabled(&mut self) -> DriverResult<()> {
+
+    // let checksum = self.get_system_variable("binlog_checksum")
+    //   .await
+    //   .and_then(QueryResult::value_as_str);
+
+
     //       let checksum = self.get_system_var("binlog_checksum")
     //           .map(from_value::<String>)
     //           .unwrap_or("NONE".to_owned());
@@ -711,9 +725,10 @@ pub fn scramble_password(
 
 pub struct BinlogStream;
 
+
 /// Owned results for 0..N rows.
 pub struct QueryResults {
-  columns: Arc<Vec<ColumnDefinition>>,
+  columns: Arc<Vec<Column>>,
   rows: Vec<Row>,
 }
 
@@ -745,12 +760,54 @@ impl Default for QueryResults {
 
 /// Owned result for a single row.
 pub struct QueryResult {
-  columns: Arc<Vec<ColumnDefinition>>,
+  columns: Arc<Vec<Column>>,
   row: Row,
 }
 
 /// Reference to a single row.
 pub struct QueryResultRef<'a> {
-  columns: Arc<Vec<ColumnDefinition>>,
+  columns: Arc<Vec<Column>>,
   row: &'a Row,
 }
+
+pub struct Field {
+  column: Column,
+  value: Value,
+}
+
+impl Field {
+  fn as_str(&self) -> Option<&str> {
+    // match self.value {
+    //   Value::Bytes(ref bytes) if self.column.column_type() => { None },
+    //   _ => None,
+    // }
+    todo!()
+  }
+
+  fn as_u8(&self) -> Option<u8> { todo!() }
+  fn as_u16(&self) -> Option<u16> { todo!() }
+  fn as_u32(&self) -> Option<u32> { todo!() }
+  fn as_u64(&self) -> Option<u64> { todo!() }
+  fn as_i8(&self) -> Option<i8> { todo!() }
+  fn as_i16(&self) -> Option<i16> { todo!() }
+  fn as_i32(&self) -> Option<i32> { todo!() }
+  fn as_i64(&self) -> Option<i64> { todo!() }
+  fn as_f32(&self) -> Option<f32> { todo!() }
+  fn as_f64(&self) -> Option<f64> { todo!() }
+
+  fn is_u8(&self) -> bool { self.as_u8().is_some() }
+  fn is_u16(&self) -> bool { self.as_u16().is_some() }
+  fn is_u32(&self) -> bool { self.as_u32().is_some() }
+  fn is_u64(&self) -> bool { self.as_u64().is_some() }
+  fn is_i8(&self) -> bool { self.as_i8().is_some() }
+  fn is_i16(&self) -> bool { self.as_i16().is_some() }
+  fn is_i32(&self) -> bool { self.as_i32().is_some() }
+  fn is_i64(&self) -> bool { self.as_i64().is_some() }
+  fn is_f32(&self) -> bool { self.as_f32().is_some() }
+  fn is_f64(&self) -> bool { self.as_f64().is_some() }
+
+  // TODO add other safe type conversions
+}
+
+#[derive(Debug)]
+pub struct BinlogEvent;

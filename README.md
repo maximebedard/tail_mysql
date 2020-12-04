@@ -21,7 +21,6 @@ Wanted to get a bit more familiar with tokio, and decoding things are fun. And i
 - make the parsing logic safer (e.g return unexpected EOF)
 - potentially reduce copying of data in a whole lot of places during parsing
 - add a lot of tests
-- error handling is an absolute mess
 
 # Testing
 
