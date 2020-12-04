@@ -3,6 +3,10 @@ use bytes::Buf;
 use std::io;
 
 pub trait BufExt: Buf {
+  fn peek_u8(&self) -> Option<u8> {
+    self.bytes().first().copied()
+  }
+
   fn get_lenc_bytes(&mut self) -> Vec<u8> {
     self.safe_get_lenc_bytes().unwrap()
   }
@@ -10,7 +14,9 @@ pub trait BufExt: Buf {
   fn safe_get_lenc_bytes(&mut self) -> io::Result<Vec<u8>> {
     let len = self.safe_get_lenc_uint()? as usize;
     let mut bytes = vec![0; len];
-    self.copy_to_slice(bytes.as_mut_slice());
+    if bytes.len() > 0 {
+      self.copy_to_slice(bytes.as_mut_slice());
+    }
     Ok(bytes)
   }
 

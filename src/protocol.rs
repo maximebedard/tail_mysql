@@ -590,7 +590,7 @@ pub struct Packet {
 }
 
 impl Packet {
-  pub fn check<B: Buf>(b: &mut B) -> bool {
+  pub fn check(b: &mut impl Buf) -> bool {
     if b.remaining() < 4 {
       return false;
     }
@@ -600,7 +600,7 @@ impl Packet {
     b.remaining() >= payload_len
   }
 
-  pub fn parse<B: Buf>(b: &mut B) -> io::Result<Self> {
+  pub fn parse(b: &mut impl Buf) -> io::Result<Self> {
     let payload_len = b.get_uint_le(3) as usize;
     let sequence_id = b.get_u8();
 
@@ -622,11 +622,30 @@ impl Packet {
   }
 }
 
+pub enum GenericResponse {
+  ServerOk(ServerOk),
+  ServerError(ServerError),
+}
+
 pub struct Payload(Vec<u8>);
 
 impl Payload {
   pub fn as_bytes(&self) -> &[u8] {
     self.0.as_slice()
+  }
+
+  pub fn as_generic_response(self, capabilities: CapabilityFlags) -> io::Result<GenericResponse> {
+    match self.0[0] {
+      0x00 => Ok(GenericResponse::ServerOk(ServerOk::parse(
+        self.0,
+        capabilities,
+      )?)),
+      0xFF => Ok(GenericResponse::ServerError(ServerError::parse(
+        self.0,
+        capabilities,
+      )?)),
+      _ => todo!(),
+    }
   }
 
   pub fn as_server_ok(self, capabilities: CapabilityFlags) -> io::Result<ServerOk> {
@@ -697,9 +716,9 @@ impl Payload {
         self.0,
         capabilities,
       )?)),
-      _ => Ok(ColumnDefinitionResponse::ColumnDefinition(
-        Column::parse(self.0)?,
-      )),
+      _ => Ok(ColumnDefinitionResponse::ColumnDefinition(Column::parse(
+        self.0,
+      )?)),
     }
   }
 
@@ -713,9 +732,9 @@ impl Payload {
       0x00 | 0xFE => Ok(RowResponse::Success(ServerOk::parse(self.0, capabilities)?)),
       _ => {
         let mut values = Vec::with_capacity(columns.len());
-
+        let mut b = self.0.as_slice();
         for i in 0..columns.len() {
-          let value = Value::parse2(&self.0[..], &columns[i])?;
+          let value = Value::parse_from_text(&mut b, &columns[i])?;
           values.push(value);
         }
 
@@ -727,6 +746,12 @@ impl Payload {
 
 #[derive(Debug)]
 pub struct Row(Vec<Value>);
+
+impl Row {
+  pub fn values(&self) -> &[Value] {
+    self.0.as_slice()
+  }
+}
 
 #[derive(Debug)]
 pub enum RowResponse {

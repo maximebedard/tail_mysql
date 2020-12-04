@@ -26,7 +26,8 @@ Wanted to get a bit more familiar with tokio, and decoding things are fun. And i
 
 ```sh
 # starting a docker container to test against
-docker run --detach --name=actw_mysql \
+docker run --name=tail_mysql \
+  --volume $PWD/config:/etc/mysql/conf.d \
   --env="MYSQL_ROOT_PASSWORD=password" \
   --publish 3306:3306 mysql:5.7
 

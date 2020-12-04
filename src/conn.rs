@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut, BytesMut};
+use futures::stream::{self, Stream};
 use std::io;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -6,12 +7,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{lookup_host, TcpStream};
 use url::{Host as UrlHost, Url};
-use futures::stream::{self, Stream};
 
 use super::protocol::{
-  AuthResponse, BinlogDumpFlags, CapabilityFlags, CharacterSet, Column,
-  ColumnDefinitionResponse, Command, Handshake, HandshakeResponse, Packet, Payload, QueryResponse,
-  Row, RowResponse, ServerError, ServerOk, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME,
+  AuthResponse, BinlogDumpFlags, CapabilityFlags, CharacterSet, Column, ColumnDefinitionResponse,
+  Command, GenericResponse, Handshake, HandshakeResponse, Packet, Payload, QueryResponse, Row,
+  RowResponse, ServerError, ServerOk, StatusFlags, CACHING_SHA2_PASSWORD_PLUGIN_NAME,
   MAX_PAYLOAD_LEN, MYSQL_NATIVE_PASSWORD_PLUGIN_NAME,
 };
 use super::value::Value;
@@ -32,6 +32,8 @@ pub enum DriverError {
   ConnectionClosed,
   #[error("Failed due to server error")]
   UpstreamError(#[from] UpstreamError),
+  #[error("Failed to start binlog stream, replication is not configured.")]
+  ReplicationDisabled,
 }
 
 type DriverResult<T> = Result<T, DriverError>;
@@ -349,6 +351,19 @@ impl Connection {
     Ok(())
   }
 
+  async fn read_generic_reponse(&mut self) -> DriverResult<()> {
+    let payload = self.read_payload().await?;
+    let generic_response = payload.as_generic_response(self.capabilities)?;
+
+    match generic_response {
+      GenericResponse::ServerOk(ok) => {
+        self.handle_ok(ok);
+        Ok(())
+      }
+      GenericResponse::ServerError(err) => Err(self.handle_server_error(err).into()),
+    }
+  }
+
   async fn read_results(&mut self) -> DriverResult<QueryResults> {
     let payload = self.read_payload().await?;
     let query_response = payload.as_query_response(self.capabilities)?;
@@ -548,15 +563,20 @@ impl Connection {
   pub async fn binlog_stream<'a>(
     &'a mut self,
     replication_opts: impl Into<ReplicationOptions>,
-  ) -> DriverResult<impl Stream<Item = BinlogEvent> + 'a> {
-    let r = self.pop("SHOW MASTER STATUS").await?;
-    let file = "toto";
-    let position = 0;
-    let opts = replication_opts.into();
+  ) -> DriverResult<impl Stream<Item = DriverResult<BinlogEvent>> + 'a> {
+    let master_status = self.pop("SHOW MASTER STATUS").await.and_then(|r| {
+      r.map(Ok)
+        .unwrap_or_else(|| Err(DriverError::ReplicationDisabled))
+    })?;
 
-    self
-      .resume_binlog_stream(opts, file, position)
-      .await
+    let values = master_status.values();
+    println!("{:?}", values);
+    let file = values[0].as_str().expect("Must be string").to_string();
+    let position = values[1].as_u32().expect("Must be u32");
+    let opts = replication_opts.into();
+    println!("binlog file = {}", file);
+    println!("position = {}", position);
+    self.resume_binlog_stream(opts, file, position).await
   }
 
   /// Returns a stream that yields binlog events, starting from a given position and binlog file.
@@ -565,7 +585,7 @@ impl Connection {
     replication_opts: impl Into<ReplicationOptions>,
     file: impl AsRef<str>,
     position: u32,
-  ) -> DriverResult<impl Stream<Item = BinlogEvent> + 'a> {
+  ) -> DriverResult<impl Stream<Item = DriverResult<BinlogEvent>> + 'a> {
     let replication_opts = replication_opts.into();
     let server_id = replication_opts.server_id();
 
@@ -573,21 +593,31 @@ impl Connection {
     self.register_as_replica(&replication_opts).await?;
     self.dump_binlog(server_id, file, position).await?;
 
-    let stream = futures::stream::unfold(self, |this| async move {
-      this.read_packet().await.unwrap();
-      // TODO: parse this into proper binlog events...
-      None
+    let stream = futures::stream::unfold(self, |conn| async move {
+      conn
+        .read_binlog_event()
+        .await
+        .transpose()
+        .map(|evt| (evt, conn))
     });
 
     Ok(stream)
   }
 
+  async fn read_binlog_event(&mut self) -> DriverResult<Option<BinlogEvent>> {
+    let payload = self.read_payload().await?;
+    // let binlog_response = payload.as_binlog_response()?;
+    todo!()
+  }
+
   async fn ensure_checksum_is_disabled(&mut self) -> DriverResult<()> {
+    self.query("SET @master_binlog_checksum='NONE'").await?;
+    Ok(())
+    // TODO: it most likely better to check the value before actually trying to set it.
 
     // let checksum = self.get_system_variable("binlog_checksum")
     //   .await
     //   .and_then(QueryResult::value_as_str);
-
 
     //       let checksum = self.get_system_var("binlog_checksum")
     //           .map(from_value::<String>)
@@ -601,7 +631,6 @@ impl Connection {
     //           }
     //           _ => Err(DriverError(UnexpectedPacket)),
     //       }
-    todo!()
   }
 
   async fn register_as_replica(
@@ -632,8 +661,9 @@ impl Connection {
     self
       .write_command(Command::COM_REGISTER_SLAVE, &b[..])
       .await?;
-    // TODO handle response
-    todo!()
+    self.read_generic_reponse().await?;
+
+    Ok(())
   }
 
   async fn dump_binlog(
@@ -654,26 +684,9 @@ impl Connection {
     b.put(file);
 
     self.write_command(Command::COM_BINLOG_DUMP, &b[..]).await?;
-    // TODO handle response
-    todo!()
+
+    Ok(())
   }
-
-  // pub fn binlog_reader(mut self) -> MyResult<Box<(FnMut() -> MyResult<Vec<u8>>)>> {
-  //       let (file_name, position) = self.first("show master status").and_then(|result| {
-  //           let (file_name, position, _, _, _) : (String, u32, String, String, String) = from_row(result.unwrap());
-  //           Ok((file_name, position))
-  //       })?;
-
-  //       self.binlog_reader_from_position(file_name, position)
-  //   }
-
-  //   pub fn binlog_reader_from_position(mut self, file_name: String, position: u32) -> MyResult<Box<(FnMut() -> MyResult<Vec<u8>>)>> {
-  //       self._disable_checksum()?;
-  //       self._write_register_slave_command()?;
-  //       self._write_binlog_dump_command(file_name, position)?;
-
-  //       Ok(Box::new(move || { self.read_packet() }))
-  //   }
 }
 
 fn default_character_set() -> CharacterSet {
@@ -723,9 +736,6 @@ pub fn scramble_password(
   }
 }
 
-pub struct BinlogStream;
-
-
 /// Owned results for 0..N rows.
 pub struct QueryResults {
   columns: Arc<Vec<Column>>,
@@ -764,50 +774,98 @@ pub struct QueryResult {
   row: Row,
 }
 
+impl QueryResult {
+  pub fn values(&self) -> &[Value] {
+    self.row.values()
+  }
+}
+
 /// Reference to a single row.
 pub struct QueryResultRef<'a> {
   columns: Arc<Vec<Column>>,
   row: &'a Row,
 }
 
-pub struct Field {
-  column: Column,
-  value: Value,
-}
+// pub struct Field {
+//   column: Column,
+//   value: Value,
+// }
 
-impl Field {
-  fn as_str(&self) -> Option<&str> {
-    // match self.value {
-    //   Value::Bytes(ref bytes) if self.column.column_type() => { None },
-    //   _ => None,
-    // }
-    todo!()
-  }
+// impl Field {
+//   fn as_str(&self) -> Option<&str> {
+//     // match self.value {
+//     //   Value::Bytes(ref bytes) if self.column.column_type() => { None },
+//     //   _ => None,
+//     // }
+//     todo!()
+//   }
 
-  fn as_u8(&self) -> Option<u8> { todo!() }
-  fn as_u16(&self) -> Option<u16> { todo!() }
-  fn as_u32(&self) -> Option<u32> { todo!() }
-  fn as_u64(&self) -> Option<u64> { todo!() }
-  fn as_i8(&self) -> Option<i8> { todo!() }
-  fn as_i16(&self) -> Option<i16> { todo!() }
-  fn as_i32(&self) -> Option<i32> { todo!() }
-  fn as_i64(&self) -> Option<i64> { todo!() }
-  fn as_f32(&self) -> Option<f32> { todo!() }
-  fn as_f64(&self) -> Option<f64> { todo!() }
+//   fn as_u8(&self) -> Option<u8> {
+//     todo!()
+//   }
+//   fn as_u16(&self) -> Option<u16> {
+//     todo!()
+//   }
+//   fn as_u32(&self) -> Option<u32> {
+//     todo!()
+//   }
+//   fn as_u64(&self) -> Option<u64> {
+//     todo!()
+//   }
+//   fn as_i8(&self) -> Option<i8> {
+//     todo!()
+//   }
+//   fn as_i16(&self) -> Option<i16> {
+//     todo!()
+//   }
+//   fn as_i32(&self) -> Option<i32> {
+//     todo!()
+//   }
+//   fn as_i64(&self) -> Option<i64> {
+//     todo!()
+//   }
+//   fn as_f32(&self) -> Option<f32> {
+//     todo!()
+//   }
+//   fn as_f64(&self) -> Option<f64> {
+//     todo!()
+//   }
 
-  fn is_u8(&self) -> bool { self.as_u8().is_some() }
-  fn is_u16(&self) -> bool { self.as_u16().is_some() }
-  fn is_u32(&self) -> bool { self.as_u32().is_some() }
-  fn is_u64(&self) -> bool { self.as_u64().is_some() }
-  fn is_i8(&self) -> bool { self.as_i8().is_some() }
-  fn is_i16(&self) -> bool { self.as_i16().is_some() }
-  fn is_i32(&self) -> bool { self.as_i32().is_some() }
-  fn is_i64(&self) -> bool { self.as_i64().is_some() }
-  fn is_f32(&self) -> bool { self.as_f32().is_some() }
-  fn is_f64(&self) -> bool { self.as_f64().is_some() }
+//   fn is_u8(&self) -> bool {
+//     self.as_u8().is_some()
+//   }
+//   fn is_u16(&self) -> bool {
+//     self.as_u16().is_some()
+//   }
+//   fn is_u32(&self) -> bool {
+//     self.as_u32().is_some()
+//   }
+//   fn is_u64(&self) -> bool {
+//     self.as_u64().is_some()
+//   }
+//   fn is_i8(&self) -> bool {
+//     self.as_i8().is_some()
+//   }
+//   fn is_i16(&self) -> bool {
+//     self.as_i16().is_some()
+//   }
+//   fn is_i32(&self) -> bool {
+//     self.as_i32().is_some()
+//   }
+//   fn is_i64(&self) -> bool {
+//     self.as_i64().is_some()
+//   }
+//   fn is_f32(&self) -> bool {
+//     self.as_f32().is_some()
+//   }
+//   fn is_f64(&self) -> bool {
+//     self.as_f64().is_some()
+//   }
 
-  // TODO add other safe type conversions
-}
+//   // TODO add other safe type conversions
+// }
+
+// https://mariadb.com/kb/en/connection/#sslrequest-packet
 
 #[derive(Debug)]
 pub struct BinlogEvent;
